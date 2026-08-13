@@ -1,22 +1,19 @@
 import("stdfaust.lib");
 
-// --- Minimal FM synth with a frequency sweep ---
-// Carrier frequency sweeps between two bounds using a slow LFO.
-// Modulator frequency and index shape the FM sidebands.
+// --- FM synth, controlled via 2 params: carrier frequency and FM index ---
+// Modulator frequency is derived from the carrier via a fixed ratio,
+// slightly detuned off an integer for a bit of movement/beating.
 
-carrierMin = 150;
-carrierMax = 600;
-sweepRate  = 0.1; // Hz, one sweep cycle every 10s
+carrierFreq = hslider("carrierFreq", 300, 40, 1500, 0.01) : si.smoo;
+modIndex    = hslider("modIndex", 4, 1, 200, 0.01) : si.smoo;
 
-carrierFreq = carrierMin + (carrierMax - carrierMin) * (os.osc(sweepRate) * 0.5 + 0.5);
+modFreqRatio = 3.01;
+//modFreq = carrierFreq * modFreqRatio;
+modFreq = modIndex;
 
-modFreqRatio = 3.01;   // modulator freq relative to carrier (slightly detuned for movement)
-modIndex     = 4;      // FM index (modulation depth)
-
-modFreq = carrierFreq * modFreqRatio;
-modulator = os.osc(modFreq) * modIndex * carrierFreq;
-
-fmVoice = os.osc(carrierFreq + modulator);
+//modulator = os.osc(modFreq) * modIndex * carrierFreq;
+modulator = os.osc(modFreq) * 400;
+fmVoice   = os.osc(carrierFreq + modulator);
 
 gain = 0.25;
 
