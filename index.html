@@ -35,8 +35,7 @@
   }
   button:disabled { background: #444; color: #777; cursor: default; }
 
-  #powerBtn.on { background: #4caf50; color: white; }
-  #muteBtn.muted { background: #a33; color: white; }
+  #powerBtn.on { background: #2a5f2d; color: white; }
 
   #xyPad {
     position: relative;
@@ -66,10 +65,15 @@
     width: 22px;
     height: 22px;
     border-radius: 50%;
-    background: #4caf50;
+    background: #555;
     transform: translate(-50%, -50%);
     pointer-events: none;
-    box-shadow: 0 0 12px rgba(76, 175, 80, 0.8);
+    box-shadow: none;
+    transition: background 0.05s, box-shadow 0.05s;
+  }
+  #xyDot.live {
+    background: #4caf50;
+    box-shadow: 0 0 14px rgba(76, 175, 80, 0.9);
   }
 
   .axisLabel {
@@ -92,8 +96,7 @@
 </head>
 <body>
   <div id="controls">
-    <button id="powerBtn">⏻ Off</button>
-    <button id="muteBtn">🔊 Sound</button>
+    <button id="powerBtn">⏻ Start engine</button>
   </div>
 
   <div id="xyPad">
@@ -104,7 +107,7 @@
     <div class="axisLabel right">freq ↑</div>
   </div>
 
-  <div id="status">Tap the power button to start</div>
+  <div id="status">Start the engine, then touch the pad to play</div>
 
   <script type="module" src="./app.js"></script>
 </body>

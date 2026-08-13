@@ -6,7 +6,6 @@ import {
 } from "./faustwasm-bundle.js";
 
 const powerBtn = document.getElementById("powerBtn");
-const muteBtn = document.getElementById("muteBtn");
 const statusEl = document.getElementById("status");
 const xyPad = document.getElementById("xyPad");
 const xyDot = document.getElementById("xyDot");
@@ -15,11 +14,9 @@ let audioContext = null;
 let compiler = null;   // Faust compiler, built once and reused
 let dspCode = null;    // .dsp source text, fetched once and reused
 let node = null;       // the compiled Faust AudioWorkletNode
-let gainNode = null;   // sits between node and destination, used for mute
-let ready = false;     // true once node is compiled and connected
+let gainNode = null;   // sits between node and destination, sound on/off lives here
+let ready = false;     // true once node is compiled and connected (engine built)
 let booting = false;
-let powerOn = false;
-let muted = false;
 
 const CARRIER_MIN = 40, CARRIER_MAX = 1500;
 const INDEX_MIN = 0, INDEX_MAX = 20;
@@ -44,7 +41,7 @@ function resolveParamPaths(n) {
   indexPath = params.find((p) => p.toLowerCase().includes("modindex"));
 }
 
-// --- Build everything: called on first "On" tap, inside the user gesture ---
+// --- Build the engine: called on the power button tap ---
 async function buildSynth() {
   if (ready || booting) return;
   booting = true;
@@ -52,7 +49,6 @@ async function buildSynth() {
   setStatus("Starting…");
 
   try {
-    // AudioContext must be created (or resumed) inside the gesture on iOS
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
     await audioContext.resume();
 
@@ -75,18 +71,17 @@ async function buildSynth() {
     resolveParamPaths(node);
 
     gainNode = audioContext.createGain();
-    gainNode.gain.value = muted ? 0 : 1;
+    gainNode.gain.value = 0; // silent until a finger is actually on the pad
     node.connect(gainNode);
     gainNode.connect(audioContext.destination);
 
     applyPadPosition();
 
     ready = true;
-    powerOn = true;
-    powerBtn.textContent = "⏻ On";
+    powerBtn.textContent = "⏻ Enabled";
     powerBtn.classList.add("on");
     xyPad.classList.add("active");
-    setStatus(muted ? "On (muted)" : "Playing");
+    setStatus("Touch the pad to play");
   } catch (err) {
     console.error(err);
     setStatus("Error: " + err.message);
@@ -96,47 +91,33 @@ async function buildSynth() {
   }
 }
 
-// --- Power switch ---
-// First press: builds everything (compile + node creation), then turns on.
-// Later presses: cheap connect/disconnect + gain ramp, no recompiling.
-async function setPower(on) {
-  if (!ready) {
-    if (on) await buildSynth();
-    return;
-  }
-  powerOn = on;
-  if (on) {
-    await audioContext.resume();
-    gainNode.gain.setTargetAtTime(muted ? 0 : 1, audioContext.currentTime, 0.01);
-    powerBtn.textContent = "⏻ On";
-    powerBtn.classList.add("on");
-    xyPad.classList.add("active");
-    setStatus(muted ? "On (muted)" : "Playing");
-  } else {
-    gainNode.gain.setTargetAtTime(0, audioContext.currentTime, 0.01);
-    powerBtn.textContent = "⏻ Off";
-    powerBtn.classList.remove("on");
-    xyPad.classList.remove("active");
-    setStatus("Off");
-  }
-}
-
-function setMute(on) {
-  muted = on;
-  muteBtn.textContent = muted ? "🔇 Muted" : "🔊 Sound";
-  muteBtn.classList.toggle("muted", muted);
-  if (powerOn && ready) {
-    gainNode.gain.setTargetAtTime(muted ? 0 : 1, audioContext.currentTime, 0.01);
-    setStatus(muted ? "On (muted)" : "Playing");
-  }
-}
-
-powerBtn.addEventListener("click", () => setPower(!powerOn));
-muteBtn.addEventListener("click", () => setMute(!muted));
+powerBtn.addEventListener("click", buildSynth);
 
 // --- XY Pad ---
+// The pad is now the sound on/off control:
+//   finger down + inside pad  -> sound on, params tracking
+//   finger moves outside pad  -> sound off (muted), but drag continues to be tracked
+//   finger re-enters pad      -> sound back on
+//   finger lifts / cancels    -> sound off
 let padX = 0.35;
 let padY = 0.2;
+let sounding = false;
+
+function setSounding(on) {
+  if (!ready || sounding === on) return;
+  sounding = on;
+  if (audioContext && gainNode) {
+    gainNode.gain.setTargetAtTime(on ? 1 : 0, audioContext.currentTime, 0.008);
+  }
+  xyDot.classList.toggle("live", on);
+  if (on) {
+    const carrierFreq = CARRIER_MIN + padX * (CARRIER_MAX - CARRIER_MIN);
+    const modIndex = INDEX_MIN + padY * (INDEX_MAX - INDEX_MIN);
+    setStatus(`carrier ${carrierFreq.toFixed(0)} Hz · index ${modIndex.toFixed(1)}`);
+  } else {
+    setStatus(ready ? "Touch the pad to play" : "Tap the power button to start");
+  }
+}
 
 function applyPadPosition() {
   if (!node) return;
@@ -145,7 +126,7 @@ function applyPadPosition() {
   if (carrierPath) node.setParamValue(carrierPath, carrierFreq);
   if (indexPath) node.setParamValue(indexPath, modIndex);
   updateDotPosition();
-  if (powerOn && !muted) {
+  if (sounding) {
     setStatus(`carrier ${carrierFreq.toFixed(0)} Hz · index ${modIndex.toFixed(1)}`);
   }
 }
@@ -156,26 +137,43 @@ function updateDotPosition() {
   xyDot.style.top = `${(1 - padY) * rect.height}px`;
 }
 
-function handlePadPointer(clientX, clientY) {
+// Clamp position for the *dot visual* to pad bounds, but track whether the
+// raw finger position is actually inside the pad rect (for sound on/off).
+function handlePadPointer(clientX, clientY, isInsideCheck) {
   const rect = xyPad.getBoundingClientRect();
+  const insideX = clientX >= rect.left && clientX <= rect.right;
+  const insideY = clientY >= rect.top && clientY <= rect.bottom;
+  const inside = insideX && insideY;
+
   padX = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
   padY = Math.min(1, Math.max(0, 1 - (clientY - rect.top) / rect.height));
   applyPadPosition();
+
+  if (isInsideCheck) setSounding(inside);
 }
 
 let dragging = false;
 
 xyPad.addEventListener("pointerdown", (e) => {
+  if (!ready) return;
   dragging = true;
+  // Capture on the pad so we keep receiving move events even once the
+  // finger drifts outside the pad's bounds (needed to detect re-entry).
   xyPad.setPointerCapture(e.pointerId);
-  handlePadPointer(e.clientX, e.clientY);
+  handlePadPointer(e.clientX, e.clientY, true);
 });
 xyPad.addEventListener("pointermove", (e) => {
   if (!dragging) return;
-  handlePadPointer(e.clientX, e.clientY);
+  handlePadPointer(e.clientX, e.clientY, true);
 });
-xyPad.addEventListener("pointerup", () => { dragging = false; });
-xyPad.addEventListener("pointercancel", () => { dragging = false; });
+xyPad.addEventListener("pointerup", () => {
+  dragging = false;
+  setSounding(false);
+});
+xyPad.addEventListener("pointercancel", () => {
+  dragging = false;
+  setSounding(false);
+});
 
 window.addEventListener("resize", updateDotPosition);
 window.addEventListener("load", updateDotPosition);
