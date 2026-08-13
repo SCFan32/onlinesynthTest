@@ -5,23 +5,22 @@ import {
   FaustMonoDspGenerator,
 } from "./faustwasm-bundle.js";
 
-const toggleBtn = document.getElementById("toggleBtn");
+const powerBtn = document.getElementById("powerBtn");
+const muteBtn = document.getElementById("muteBtn");
 const statusEl = document.getElementById("status");
 const xyPad = document.getElementById("xyPad");
 const xyDot = document.getElementById("xyDot");
 
 let audioContext = null;
-let compiler = null;
-let dspCode = null;
-let node = null;
-let playing = false;
-let booting = false;
+let node = null;       // the compiled Faust AudioWorkletNode (created once, kept alive)
+let gainNode = null;   // sits between node and destination, used for mute
+let ready = false;     // true once node is compiled and instantiated
+let powerOn = false;   // power switch state (connects/disconnects node -> gain)
+let muted = false;     // mute switch state (gain 0 vs 1)
 
-// Param ranges — must match the hslider() bounds in fm.dsp
 const CARRIER_MIN = 40, CARRIER_MAX = 1500;
 const INDEX_MIN = 0, INDEX_MAX = 20;
 
-// Resolved once the node is created (paths come straight from the compiled DSP)
 let carrierPath = null;
 let indexPath = null;
 
@@ -34,36 +33,24 @@ async function loadDspSource() {
   return await res.text();
 }
 
-async function ensureCompiled() {
-  if (compiler) return;
-  setStatus("Loading Faust compiler…");
-  const faustModule = await instantiateFaustModuleFromFile("./libfaust/libfaust-wasm.js");
-  const libFaust = new LibFaust(faustModule);
-  compiler = new FaustCompiler(libFaust);
-  dspCode = await loadDspSource();
-}
-
-function resolveParamPaths(newNode) {
-  const params = newNode.getParams(); // e.g. ["/fmSynth/carrierFreq", "/fmSynth/modIndex"]
+function resolveParamPaths(n) {
+  const params = n.getParams();
   carrierPath = params.find((p) => p.toLowerCase().includes("carrierfreq"));
   indexPath = params.find((p) => p.toLowerCase().includes("modindex"));
 }
 
-async function startAudio() {
-  if (playing || booting) return;
-  booting = true;
-  toggleBtn.disabled = true;
-  setStatus("Starting…");
-
+// --- Precompile as soon as the page loads, so Start is instant later ---
+async function precompile() {
+  setStatus("Preparing synth…");
   try {
-    if (!audioContext) {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    await audioContext.resume();
+    // AudioContext can be created without a gesture; it just starts "suspended"
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
-    await ensureCompiled();
+    const faustModule = await instantiateFaustModuleFromFile("./libfaust/libfaust-wasm.js");
+    const libFaust = new LibFaust(faustModule);
+    const compiler = new FaustCompiler(libFaust);
+    const dspCode = await loadDspSource();
 
-    setStatus("Compiling DSP…");
     const generator = new FaustMonoDspGenerator();
     await generator.compile(compiler, "fmSynth", dspCode, "");
 
@@ -71,45 +58,59 @@ async function startAudio() {
     if (!node) throw new Error("Failed to create audio node");
 
     resolveParamPaths(node);
-    node.connect(audioContext.destination);
 
-    // Apply current pad position immediately
-    applyPadPosition();
+    gainNode = audioContext.createGain();
+    gainNode.gain.value = 0; // start muted, connect graph happens on power-on
+    node.connect(gainNode);
+    gainNode.connect(audioContext.destination);
 
-    playing = true;
-    toggleBtn.textContent = "■ Stop";
-    xyPad.classList.add("active");
-    setStatus("Playing");
+    applyPadPosition(); // push current pad position into the synth right away
+
+    ready = true;
+    powerBtn.disabled = false;
+    setStatus("Ready — tap the power button");
   } catch (err) {
     console.error(err);
-    setStatus("Error: " + err.message);
-  } finally {
-    booting = false;
-    toggleBtn.disabled = false;
+    setStatus("Error preparing synth: " + err.message);
   }
 }
 
-function stopAudio() {
-  if (!playing) return;
-  if (node) {
-    node.disconnect();
-    if (typeof node.destroy === "function") node.destroy();
-    node = null;
+// --- Power switch: resumes context and unmutes according to current mute state ---
+async function setPower(on) {
+  if (!ready) return;
+  powerOn = on;
+  if (on) {
+    await audioContext.resume(); // needs to happen inside/after a user gesture on iOS
+    gainNode.gain.setTargetAtTime(muted ? 0 : 1, audioContext.currentTime, 0.01);
+    powerBtn.textContent = "⏻ On";
+    powerBtn.classList.add("on");
+    xyPad.classList.add("active");
+    setStatus(muted ? "On (muted)" : "Playing");
+  } else {
+    gainNode.gain.setTargetAtTime(0, audioContext.currentTime, 0.01);
+    powerBtn.textContent = "⏻ Off";
+    powerBtn.classList.remove("on");
+    xyPad.classList.remove("active");
+    setStatus("Off");
   }
-  playing = false;
-  toggleBtn.textContent = "▶ Start";
-  xyPad.classList.remove("active");
-  setStatus("Stopped");
 }
 
-toggleBtn.addEventListener("click", () => {
-  if (playing) stopAudio();
-  else startAudio();
-});
+// --- Mute switch: independent of power, just a gain flip ---
+function setMute(on) {
+  muted = on;
+  muteBtn.textContent = muted ? "🔇 Muted" : "🔊 Sound";
+  muteBtn.classList.toggle("muted", muted);
+  if (powerOn && audioContext) {
+    gainNode.gain.setTargetAtTime(muted ? 0 : 1, audioContext.currentTime, 0.01);
+    setStatus(muted ? "On (muted)" : "Playing");
+  }
+}
+
+powerBtn.addEventListener("click", () => setPower(!powerOn));
+muteBtn.addEventListener("click", () => setMute(!muted));
 
 // --- XY Pad ---
-// X axis -> carrier frequency (Hz), Y axis -> FM index (0 = bottom, max = top)
-let padX = 0.35; // normalized 0..1, initial position
+let padX = 0.35;
 let padY = 0.2;
 
 function applyPadPosition() {
@@ -119,13 +120,15 @@ function applyPadPosition() {
   if (carrierPath) node.setParamValue(carrierPath, carrierFreq);
   if (indexPath) node.setParamValue(indexPath, modIndex);
   updateDotPosition();
-  setStatus(`carrier ${carrierFreq.toFixed(0)} Hz · index ${modIndex.toFixed(1)}`);
+  if (powerOn && !muted) {
+    setStatus(`carrier ${carrierFreq.toFixed(0)} Hz · index ${modIndex.toFixed(1)}`);
+  }
 }
 
 function updateDotPosition() {
   const rect = xyPad.getBoundingClientRect();
   xyDot.style.left = `${padX * rect.width}px`;
-  xyDot.style.top = `${(1 - padY) * rect.height}px`; // invert Y: up = higher index
+  xyDot.style.top = `${(1 - padY) * rect.height}px`;
 }
 
 function handlePadPointer(clientX, clientY) {
@@ -137,6 +140,10 @@ function handlePadPointer(clientX, clientY) {
 
 let dragging = false;
 
+// Dragging the dot never touches power/mute state — so power/mute buttons
+// remain fully tappable mid-drag (important for iOS multi-touch: dragging
+// with one finger while tapping power/mute with another works, since they're
+// independent event listeners on separate elements).
 xyPad.addEventListener("pointerdown", (e) => {
   dragging = true;
   xyPad.setPointerCapture(e.pointerId);
@@ -149,6 +156,9 @@ xyPad.addEventListener("pointermove", (e) => {
 xyPad.addEventListener("pointerup", () => { dragging = false; });
 xyPad.addEventListener("pointercancel", () => { dragging = false; });
 
-// Keep dot positioned correctly on resize
 window.addEventListener("resize", updateDotPosition);
 window.addEventListener("load", updateDotPosition);
+
+// Kick off precompilation immediately
+powerBtn.disabled = true; // until ready
+precompile();
