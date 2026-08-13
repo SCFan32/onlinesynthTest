@@ -12,11 +12,14 @@ const xyPad = document.getElementById("xyPad");
 const xyDot = document.getElementById("xyDot");
 
 let audioContext = null;
-let node = null;       // the compiled Faust AudioWorkletNode (created once, kept alive)
+let compiler = null;   // Faust compiler, built once and reused
+let dspCode = null;    // .dsp source text, fetched once and reused
+let node = null;       // the compiled Faust AudioWorkletNode
 let gainNode = null;   // sits between node and destination, used for mute
-let ready = false;     // true once node is compiled and instantiated
-let powerOn = false;   // power switch state (connects/disconnects node -> gain)
-let muted = false;     // mute switch state (gain 0 vs 1)
+let ready = false;     // true once node is compiled and connected
+let booting = false;
+let powerOn = false;
+let muted = false;
 
 const CARRIER_MIN = 40, CARRIER_MAX = 1500;
 const INDEX_MIN = 0, INDEX_MAX = 20;
@@ -29,8 +32,10 @@ function setStatus(msg) {
 }
 
 async function loadDspSource() {
+  if (dspCode) return dspCode;
   const res = await fetch("./fm.dsp");
-  return await res.text();
+  dspCode = await res.text();
+  return dspCode;
 }
 
 function resolveParamPaths(n) {
@@ -39,20 +44,30 @@ function resolveParamPaths(n) {
   indexPath = params.find((p) => p.toLowerCase().includes("modindex"));
 }
 
-// --- Precompile as soon as the page loads, so Start is instant later ---
-async function precompile() {
-  setStatus("Preparing synth…");
+// --- Build everything: called on first "On" tap, inside the user gesture ---
+async function buildSynth() {
+  if (ready || booting) return;
+  booting = true;
+  powerBtn.disabled = true;
+  setStatus("Starting…");
+
   try {
-    // AudioContext can be created without a gesture; it just starts "suspended"
+    // AudioContext must be created (or resumed) inside the gesture on iOS
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    await audioContext.resume();
 
-    const faustModule = await instantiateFaustModuleFromFile("./libfaust/libfaust-wasm.js");
-    const libFaust = new LibFaust(faustModule);
-    const compiler = new FaustCompiler(libFaust);
-    const dspCode = await loadDspSource();
+    if (!compiler) {
+      setStatus("Loading Faust compiler…");
+      const faustModule = await instantiateFaustModuleFromFile("./libfaust/libfaust-wasm.js");
+      const libFaust = new LibFaust(faustModule);
+      compiler = new FaustCompiler(libFaust);
+    }
 
+    const code = await loadDspSource();
+
+    setStatus("Compiling DSP…");
     const generator = new FaustMonoDspGenerator();
-    await generator.compile(compiler, "fmSynth", dspCode, "");
+    await generator.compile(compiler, "fmSynth", code, "");
 
     node = await generator.createNode(audioContext);
     if (!node) throw new Error("Failed to create audio node");
@@ -60,27 +75,38 @@ async function precompile() {
     resolveParamPaths(node);
 
     gainNode = audioContext.createGain();
-    gainNode.gain.value = 0; // start muted, connect graph happens on power-on
+    gainNode.gain.value = muted ? 0 : 1;
     node.connect(gainNode);
     gainNode.connect(audioContext.destination);
 
-    applyPadPosition(); // push current pad position into the synth right away
+    applyPadPosition();
 
     ready = true;
-    powerBtn.disabled = false;
-    setStatus("Ready — tap the power button");
+    powerOn = true;
+    powerBtn.textContent = "⏻ On";
+    powerBtn.classList.add("on");
+    xyPad.classList.add("active");
+    setStatus(muted ? "On (muted)" : "Playing");
   } catch (err) {
     console.error(err);
-    setStatus("Error preparing synth: " + err.message);
+    setStatus("Error: " + err.message);
+  } finally {
+    booting = false;
+    powerBtn.disabled = false;
   }
 }
 
-// --- Power switch: resumes context and unmutes according to current mute state ---
+// --- Power switch ---
+// First press: builds everything (compile + node creation), then turns on.
+// Later presses: cheap connect/disconnect + gain ramp, no recompiling.
 async function setPower(on) {
-  if (!ready) return;
+  if (!ready) {
+    if (on) await buildSynth();
+    return;
+  }
   powerOn = on;
   if (on) {
-    await audioContext.resume(); // needs to happen inside/after a user gesture on iOS
+    await audioContext.resume();
     gainNode.gain.setTargetAtTime(muted ? 0 : 1, audioContext.currentTime, 0.01);
     powerBtn.textContent = "⏻ On";
     powerBtn.classList.add("on");
@@ -95,12 +121,11 @@ async function setPower(on) {
   }
 }
 
-// --- Mute switch: independent of power, just a gain flip ---
 function setMute(on) {
   muted = on;
   muteBtn.textContent = muted ? "🔇 Muted" : "🔊 Sound";
   muteBtn.classList.toggle("muted", muted);
-  if (powerOn && audioContext) {
+  if (powerOn && ready) {
     gainNode.gain.setTargetAtTime(muted ? 0 : 1, audioContext.currentTime, 0.01);
     setStatus(muted ? "On (muted)" : "Playing");
   }
@@ -140,10 +165,6 @@ function handlePadPointer(clientX, clientY) {
 
 let dragging = false;
 
-// Dragging the dot never touches power/mute state — so power/mute buttons
-// remain fully tappable mid-drag (important for iOS multi-touch: dragging
-// with one finger while tapping power/mute with another works, since they're
-// independent event listeners on separate elements).
 xyPad.addEventListener("pointerdown", (e) => {
   dragging = true;
   xyPad.setPointerCapture(e.pointerId);
@@ -159,6 +180,4 @@ xyPad.addEventListener("pointercancel", () => { dragging = false; });
 window.addEventListener("resize", updateDotPosition);
 window.addEventListener("load", updateDotPosition);
 
-// Kick off precompilation immediately
-powerBtn.disabled = true; // until ready
-precompile();
+setStatus("Tap the power button to start");
